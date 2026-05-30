@@ -3588,25 +3588,67 @@ static int32_t prompt_n_tokens_before_byte(
 static std::vector<int32_t> prompt_get_user_boundaries(
         const json & message_spans,
         const std::string & prompt,
+        const server_tokens & prompt_tokens,
         const std::vector<raw_buffer> & files,
         const llama_vocab * vocab,
         mtmd_context * mctx) {
     std::vector<int32_t> result;
     result.reserve(message_spans.size());
 
+    std::vector<int32_t> byte_positions;
+    byte_positions.reserve(message_spans.size());
     for (const auto & span : message_spans) {
         if (json_value(span, "role", std::string()) != "user") {
             continue;
         }
-
         const int32_t byte_pos = json_value(span, "pos", -1);
-        if (byte_pos < 0) {
-            continue;
+        if (byte_pos >= 0 && (size_t) byte_pos <= prompt.size()) {
+            byte_positions.push_back(byte_pos);
+        }
+    }
+
+    const bool maybe_media =
+        mctx != nullptr && (!files.empty() || prompt.find(get_media_marker()) != std::string::npos);
+
+    bool fast_path_ok = false;
+    std::vector<size_t> cum_bytes;
+    size_t shift = 0;
+
+    if (!byte_positions.empty() && !maybe_media) {
+        const llama_tokens tokens = prompt_tokens.get_text_tokens();
+
+        std::string decoded;
+        decoded.reserve(prompt.size() + 64);
+        cum_bytes.reserve(tokens.size());
+        for (const llama_token tok : tokens) {
+            decoded += common_token_to_piece(vocab, tok, true);
+            cum_bytes.push_back(decoded.size());
         }
 
-        const int32_t n_tok = prompt_n_tokens_before_byte(byte_pos, prompt, files, vocab, mctx);
-        if (n_tok > 0) {
-            result.push_back(n_tok);
+        if (decoded.size() >= prompt.size()) {
+            const size_t candidate_shift = decoded.size() - prompt.size();
+            if (decoded.compare(candidate_shift, prompt.size(), prompt) == 0) {
+                shift = candidate_shift;
+                fast_path_ok = true;
+            }
+        }
+    }
+
+    if (fast_path_ok) {
+        for (const int32_t byte_pos : byte_positions) {
+            const size_t target = (size_t) byte_pos + shift;
+            const int32_t n_tok = (int32_t)
+                (std::upper_bound(cum_bytes.begin(), cum_bytes.end(), target) - cum_bytes.begin());
+            if (n_tok > 0) {
+                result.push_back(n_tok);
+            }
+        }
+    } else {
+        for (const int32_t byte_pos : byte_positions) {
+            const int32_t n_tok = prompt_n_tokens_before_byte(byte_pos, prompt, files, vocab, mctx);
+            if (n_tok > 0) {
+                result.push_back(n_tok);
+            }
         }
     }
 
@@ -3676,6 +3718,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     prompt_get_user_boundaries(
                         message_spans,
                         prompt.get<std::string>(),
+                        task.tokens,
                         files,
                         ctx_server.vocab,
                         ctx_server.mctx);
